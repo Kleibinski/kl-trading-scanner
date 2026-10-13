@@ -1,0 +1,73 @@
+name: Scanner-Erinnerung
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 8 1 * *"
+
+permissions: {}
+
+jobs:
+  erinnerung:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Telegram-Erinnerung senden
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          token = os.environ["BOT_TOKEN"].strip()
+          chat = os.environ["CHAT_ID"].strip()
+
+          if not token or not chat:
+              raise SystemExit("Telegram-Secrets fehlen.")
+
+          text = (
+              "🔧 SCANNER-CHECK\n\n"
+              "Bitte kontrolliere deinen Trading-Scanner:\n\n"
+              "1. GitHub → kl-trading-scanner → Actions.\n"
+              "2. Handelssignale 5 Minuten oeffnen.\n"
+              "3. Gibt es aktuelle automatische Laeufe "
+              "mit gruenem Haken?\n"
+              "4. Falls deaktiviert: Enable workflow waehlen.\n"
+              "5. Bei rotem Haken: Fehlerprotokoll ansehen.\n\n"
+              "Dokumentiere die Kontrolle im Projekt:\n"
+              "Code → README.md → Stiftsymbol → "
+              "Pruefdatum aktualisieren → Commit changes.\n\n"
+              "GitHub deaktiviert Zeitplaene nach 60 Tagen "
+              "ohne Projektaktivitaet. Nur die Seite zu "
+              "oeffnen ist dafuer keine verlaessliche Vorsorge.\n\n"
+              "Diese Nachricht ist eine Erinnerung und "
+              "bestaetigt nicht, dass der Scanner funktioniert."
+          )
+
+          request = urllib.request.Request(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              data=json.dumps({
+                  "chat_id": chat,
+                  "text": text,
+              }).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+
+          try:
+              with urllib.request.urlopen(
+                  request, timeout=15
+              ) as response:
+                  result = json.load(response)
+              if not result.get("ok"):
+                  raise ValueError()
+          except Exception:
+              raise SystemExit(
+                  "Telegram-Versand fehlgeschlagen."
+              ) from None
+
+          print("Erinnerung gesendet.")
+          PY
