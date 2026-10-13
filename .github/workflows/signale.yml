@@ -3,7 +3,7 @@ name: Handelssignale 5 Minuten
 on:
   workflow_dispatch:
   schedule:
-    - cron: "2-57/5 6-20 * * 1-5"
+    - cron: "2-57/5 4-22 * * 1-5"
 
 permissions: {}
 
@@ -39,8 +39,11 @@ jobs:
           key = os.environ.get("DATA_KEY", "").strip()
           token = os.environ.get("BOT_TOKEN", "").strip()
           chat = os.environ.get("CHAT_ID", "").strip()
+
           if not all((key, token, chat)):
-              raise SystemExit("Mindestens ein erforderliches Secret fehlt.")
+              raise SystemExit(
+                  "Mindestens ein erforderliches Secret fehlt."
+              )
 
           instruments = [
               ("EUR/USD", "OANDA:EURUSD", "EUR/USD", True),
@@ -49,50 +52,69 @@ jobs:
               ("MSFT", "NASDAQ:MSFT", "Microsoft", False),
               ("NVDA", "NASDAQ:NVDA", "Nvidia", False),
               ("SPY", "AMEX:SPY", "SPDR S&P 500 ETF", False),
-              ("QQQ", "NASDAQ:QQQ", "Invesco QQQ ETF", False),
               ("GLD", "AMEX:GLD", "SPDR Gold Shares ETF", False),
           ]
 
           def active(forex, now):
               local = now.astimezone(BERLIN if forex else NY)
               minute = local.hour * 60 + local.minute
-              start = 480 if forex else 585
-              end = 1290 if forex else 930
+
+              # Devisen: 06:00 bis 00:00 deutscher Zeit.
+              # US-Instrumente: 09:45 bis 15:15 New Yorker Zeit.
+              start = 360 if forex else 585
+              end = 1440 if forex else 915
+
               return local.weekday() < 5 and start <= minute < end
 
           def smooth(values, length, alpha):
               result = [None] * (length - 1)
               result.append(sum(values[:length]) / length)
+
               for value in values[length:]:
                   result.append(
                       result[-1] + alpha * (value - result[-1])
                   )
+
               return result
 
           def ema(values, length):
               return smooth(values, length, 2 / (length + 1))
 
           def atr_adx(high, low, close, length=14):
-              tr, plus, minus = [], [], []
+              tr = []
+              plus = []
+              minus = []
+
               for i in range(1, len(close)):
                   tr.append(max(
                       high[i] - low[i],
                       abs(high[i] - close[i-1]),
                       abs(low[i] - close[i-1]),
                   ))
+
                   up = high[i] - high[i-1]
                   down = low[i-1] - low[i]
-                  plus.append(up if up > down and up > 0 else 0)
-                  minus.append(down if down > up and down > 0 else 0)
+
+                  plus.append(
+                      up if up > down and up > 0 else 0
+                  )
+                  minus.append(
+                      down if down > up and down > 0 else 0
+                  )
 
               atr = smooth(tr, length, 1 / length)
               p = smooth(plus, length, 1 / length)
               m = smooth(minus, length, 1 / length)
+
               dx = [
                   100 * abs(a - b) / (a + b) if a + b else 0
-                  for a, b in zip(p[length-1:], m[length-1:])
+                  for a, b in zip(
+                      p[length-1:], m[length-1:]
+                  )
               ]
-              return atr[-1], smooth(dx, length, 1 / length)[-1]
+
+              adx = smooth(dx, length, 1 / length)
+              return atr[-1], adx[-1]
 
           def fetch(symbol, forex):
               params = {
@@ -103,6 +125,7 @@ jobs:
                   "order": "asc",
                   "apikey": key,
               }
+
               if not forex:
                   params["country"] = "United States"
                   params["prepost"] = "false"
@@ -111,46 +134,76 @@ jobs:
                   "https://api.twelvedata.com/time_series?"
                   + urllib.parse.urlencode(params)
               )
+
               try:
-                  with urllib.request.urlopen(url, timeout=6) as response:
+                  with urllib.request.urlopen(
+                      url, timeout=6
+                  ) as response:
                       data = json.load(response)
               except Exception:
-                  raise ValueError("Kursabruf fehlgeschlagen") from None
+                  raise ValueError(
+                      "Kursabruf fehlgeschlagen"
+                  ) from None
 
               if data.get("status") == "error":
-                  # Keine API-Antwort oder URL in oeffentliche Logs schreiben.
-                  raise ValueError("Datenanbieter hat Anfrage abgelehnt")
+                  raise ValueError(
+                      "Datenanbieter hat Anfrage abgelehnt"
+                  )
 
               meta = data.get("meta", {})
+
               if meta.get("symbol") != symbol:
-                  raise ValueError("Instrument nicht bestaetigt")
+                  raise ValueError(
+                      "Instrument nicht bestaetigt"
+                  )
+
               if not forex and meta.get("currency") != "USD":
-                  raise ValueError("Unerwartete Kurswaehrung")
+                  raise ValueError(
+                      "Unerwartete Kurswaehrung"
+                  )
 
               now = datetime.now(UTC)
               bars = []
+
               for row in data.get("values", []):
                   start = datetime.strptime(
-                      row["datetime"], "%Y-%m-%d %H:%M:%S"
+                      row["datetime"],
+                      "%Y-%m-%d %H:%M:%S",
                   ).replace(tzinfo=UTC)
+
                   end = start + INTERVAL
+
                   if end > now:
                       continue
+
                   o, h, l, c = (
                       float(row[name])
                       for name in ("open", "high", "low", "close")
                   )
-                  if not all(math.isfinite(x) and x > 0 for x in (o,h,l,c)):
+
+                  if not all(
+                      math.isfinite(x) and x > 0
+                      for x in (o, h, l, c)
+                  ):
                       raise ValueError("Ungueltige Kurswerte")
+
                   if not (l <= o <= h and l <= c <= h):
-                      raise ValueError("Widerspruechliche Kurswerte")
+                      raise ValueError(
+                          "Widerspruechliche Kurswerte"
+                      )
+
                   bars.append((end, o, h, l, c))
 
               bars.sort(key=lambda b: b[0])
+
               if len(bars) < 400:
-                  raise ValueError("Zu wenige Kerzen fuer die Analyse")
+                  raise ValueError(
+                      "Zu wenige Kerzen fuer die Analyse"
+                  )
+
               if len({b[0] for b in bars}) != len(bars):
                   raise ValueError("Doppelte Kerzen erhalten")
+
               return bars
 
           def send(text):
@@ -159,57 +212,90 @@ jobs:
                   data=json.dumps({
                       "chat_id": chat,
                       "text": text,
-                      "link_preview_options": {"is_disabled": True},
+                      "link_preview_options": {
+                          "is_disabled": True
+                      },
                   }).encode(),
-                  headers={"Content-Type": "application/json"},
+                  headers={
+                      "Content-Type": "application/json"
+                  },
                   method="POST",
               )
+
               try:
-                  with urllib.request.urlopen(request, timeout=8) as response:
+                  with urllib.request.urlopen(
+                      request, timeout=8
+                  ) as response:
                       result = json.load(response)
+
                   if not result.get("ok"):
                       raise ValueError()
+
               except Exception:
-                  raise SystemExit("Telegram-Versand fehlgeschlagen.") from None
+                  raise SystemExit(
+                      "Telegram-Versand fehlgeschlagen."
+                  ) from None
 
           errors = 0
           sent = 0
 
           for symbol, tv_symbol, name, forex in instruments:
               if not active(forex, datetime.now(UTC)):
-                  print(tv_symbol + ": ausserhalb des Einstiegszeitfensters")
+                  print(
+                      tv_symbol
+                      + ": ausserhalb des Einstiegszeitfensters"
+                  )
                   continue
 
               try:
                   bars = fetch(symbol, forex)
               except Exception:
-                  # Keine Ausnahmeinhalte mit moeglichen Geheimnissen ausgeben.
+                  # Keine Zugangsdaten oder API-Antworten
+                  # in oeffentliche Protokolle schreiben.
                   errors += 1
-                  print(tv_symbol + ": Kursabruf oder Datenpruefung fehlgeschlagen")
+                  print(
+                      tv_symbol
+                      + ": Kursabruf oder Datenpruefung fehlgeschlagen"
+                  )
                   continue
 
               now = datetime.now(UTC)
               age = (now - bars[-1][0]).total_seconds()
+
               if not 0 <= age < 240:
-                  print(tv_symbol + ": keine ausreichend frische Kerze")
+                  print(
+                      tv_symbol
+                      + ": keine ausreichend frische Kerze"
+                  )
                   continue
+
               if bars[-1][0] - bars[-2][0] != INTERVAL:
-                  print(tv_symbol + ": Unterbrechung zwischen Signalkerzen")
+                  print(
+                      tv_symbol
+                      + ": Unterbrechung zwischen Signalkerzen"
+                  )
                   continue
 
               close = [b[4] for b in bars]
               high = [b[2] for b in bars]
               low = [b[3] for b in bars]
+
               e20 = ema(close, 20)
               e50 = ema(close, 50)
               e200 = ema(close, 200)
+
               atr, adx = atr_adx(high, low, close)
 
-              if not all(math.isfinite(x) for x in (atr, adx)):
+              if not all(
+                  math.isfinite(x) for x in (atr, adx)
+              ):
                   print(tv_symbol + ": ungueltiger Indikator")
                   continue
+
               if atr <= 0 or adx <= 20:
-                  print(tv_symbol + ": Trendstaerke reicht nicht")
+                  print(
+                      tv_symbol + ": Trendstaerke reicht nicht"
+                  )
                   continue
 
               pullback = bars[-2]
@@ -222,6 +308,7 @@ jobs:
                   and pullback[4] > e20[-2]
                   and confirmation[4] > pullback[2]
               )
+
               short_signal = (
                   e50[-1] < e200[-1]
                   and e50[-1] < e50[-5]
@@ -229,54 +316,83 @@ jobs:
                   and pullback[4] < e20[-2]
                   and confirmation[4] < pullback[3]
               )
+
               if not (long_signal or short_signal):
-                  print(tv_symbol + ": kein bestaetigter Einstieg")
+                  print(
+                      tv_symbol + ": kein bestaetigter Einstieg"
+                  )
                   continue
 
               direction = 1 if long_signal else -1
               digits = 5 if forex else 2
+
               entry = round(confirmation[4], digits)
               stop = round(
-                  pullback[3] - 0.25 * atr if long_signal
+                  pullback[3] - 0.25 * atr
+                  if long_signal
                   else pullback[2] + 0.25 * atr,
                   digits,
               )
+
               risk = direction * (entry - stop)
+
               if risk <= 0 or stop <= 0:
                   continue
+
               if (
-                  long_signal and confirmation[3] <= stop
-                  or short_signal and confirmation[2] >= stop
+                  (long_signal and confirmation[3] <= stop)
+                  or
+                  (short_signal and confirmation[2] >= stop)
               ):
-                  print(tv_symbol + ": Ruecksetzer bereits verletzt")
+                  print(
+                      tv_symbol + ": Ruecksetzer bereits verletzt"
+                  )
                   continue
 
-              target = round(entry + direction * 2 * risk, digits)
+              target = round(
+                  entry + direction * 2 * risk,
+                  digits,
+              )
+
               if target <= 0:
                   continue
 
               expiry = confirmation[0] + INTERVAL
               now = datetime.now(UTC)
+
               if (
                   not active(forex, now)
                   or (expiry - now).total_seconds() < 60
               ):
-                  print(tv_symbol + ": zu wenig Zeit fuer den Einstieg")
+                  print(
+                      tv_symbol + ": zu wenig Zeit fuer den Einstieg"
+                  )
                   continue
 
               lower = entry - 0.1 * risk
               upper = entry + 0.1 * risk
-              side = "🟢 BUY" if long_signal else "🔴 SELL / SHORT"
-              stamp = confirmation[0].strftime("%Y%m%d-%H%M")
+
+              side = (
+                  "🟢 BUY" if long_signal
+                  else "🔴 SELL / SHORT"
+              )
+
+              stamp = confirmation[0].strftime(
+                  "%Y%m%d-%H%M"
+              )
+
               chart = (
                   "https://www.tradingview.com/chart/?symbol="
                   + urllib.parse.quote(tv_symbol, safe="")
                   + "&interval=5"
               )
+
               source = (
                   "Twelve Data Sammelkurs; kein OANDA-Kurs."
-                  if forex else "Twelve Data."
+                  if forex
+                  else "Twelve Data."
               )
+
               text = (
                   "🚦 TREND-SIGNAL · PAPER 🚦\n"
                   f"{side} {name}\n"
@@ -286,9 +402,12 @@ jobs:
                   f"✅ Take-Profit: {target:.{digits}f}\n"
                   "Alle Preise in USD.\n\n"
                   f"⏳ Einstiegsorder gueltig bis "
-                  f"{expiry.astimezone(BERLIN):%H:%M} Uhr Berlin.\n"
-                  "Danach nur NICHT ausgefuehrte Einstiegsorder loeschen.\n"
-                  "Offene Position: Ausstieg ueber SL/TP oder manuell.\n\n"
+                  f"{expiry.astimezone(BERLIN):%H:%M} "
+                  "Uhr Berlin.\n"
+                  "Danach nur NICHT ausgefuehrte "
+                  "Einstiegsorder loeschen.\n"
+                  "Offene Position: Ausstieg ueber SL/TP "
+                  "oder manuell.\n\n"
                   f"Hier in TradingView oeffnen:\n{chart}\n"
                   "Broker: Paper Trading · Chart: 5 Minuten\n\n"
                   f"Nur einsteigen, wenn der aktuelle "
@@ -299,11 +418,18 @@ jobs:
                   f"ID: {tv_symbol}-{stamp}-5M\n"
                   "Gleiche ID nur einmal handeln."
               )
+
               send(text)
               sent += 1
               print(tv_symbol + ": Signal gesendet")
 
-          print(f"Abgeschlossen: {sent} Signale, {errors} Datenfehler.")
+          print(
+              f"Abgeschlossen: {sent} Signale, "
+              f"{errors} Datenfehler."
+          )
+
           if errors:
-              raise SystemExit("Mindestens ein Datenabruf fehlgeschlagen.")
+              raise SystemExit(
+                  "Mindestens ein Datenabruf fehlgeschlagen."
+              )
           PY
