@@ -566,11 +566,44 @@ jobs:
               print(tv_symbol + ": kein Einstieg. " + explanation)
               return 0
 
-          sent = 0
+                    sent = 0
           errors = 0
 
+          # Devisen bei jedem Durchlauf, US-Instrumente im Wechsel.
+          now = datetime.now(UTC)
+          selected = [
+              item for item in instruments
+              if item[3] and active(True, now)
+          ]
+          us_instruments = [
+              item for item in instruments if not item[3]
+          ]
+
+          if active(False, now):
+              cursor = int(state.get("us_cursor", 0)) % len(us_instruments)
+              batch_size = min(5, len(us_instruments))
+
+              selected.extend(
+                  us_instruments[(cursor + offset) % len(us_instruments)]
+                  for offset in range(batch_size)
+              )
+
+              state["us_cursor"] = (
+                  cursor + batch_size
+              ) % len(us_instruments)
+
+          save_state()
+
+          print(
+              "Instrumente in diesem Durchlauf: "
+              + (
+                  ", ".join(item[1] for item in selected)
+                  if selected else "keine; ausserhalb des Zeitfensters"
+              )
+          )
+
           try:
-              for symbol, tv_symbol, name, forex in instruments:
+              for symbol, tv_symbol, name, forex in selected:
                   if not active(forex, datetime.now(UTC)):
                       print(tv_symbol + ": ausserhalb des Zeitfensters.")
                       continue
@@ -583,7 +616,6 @@ jobs:
                       sent += scan(symbol, tv_symbol, name, forex)
                   except Exception:
                       errors += 1
-                      # Keine API-Antworten oder Secrets ausgeben.
                       print(
                           tv_symbol
                           + ": Datenpruefung oder Versand fehlgeschlagen."
@@ -593,8 +625,11 @@ jobs:
 
           summary = (
               f"Abgeschlossen: {sent} Signale, {errors} Fehler.\n"
+              f"Beobachtungsliste: {len(instruments)} Instrumente.\n"
+              f"Fuer diesen Durchlauf ausgewaehlt: {len(selected)}.\n"
               f"Gespeicherter Tageszaehler: "
               f"{state['used']}/{DAILY_LIMIT} Abrufe.\n"
+              "US-Instrumente werden im Wechsel geprueft.\n"
               "Keine Signale werden zur Erfuellung einer Quote erzeugt."
           )
           print(summary)
