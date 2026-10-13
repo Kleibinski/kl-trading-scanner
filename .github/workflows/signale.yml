@@ -59,7 +59,7 @@ jobs:
           if not all((key, token, chat)):
               raise SystemExit("Ein erforderliches Secret fehlt.")
 
-          instruments = [
+                    instruments = [
               ("EUR/USD", "OANDA:EURUSD", "EUR/USD", True),
               ("GBP/USD", "OANDA:GBPUSD", "GBP/USD", True),
               ("AAPL", "NASDAQ:AAPL", "Apple", False),
@@ -67,6 +67,9 @@ jobs:
               ("NVDA", "NASDAQ:NVDA", "Nvidia", False),
               ("SPY", "AMEX:SPY", "SPDR S&P 500 ETF", False),
               ("GLD", "AMEX:GLD", "SPDR Gold Shares ETF", False),
+              ("AMZN", "NASDAQ:AMZN", "Amazon", False),
+              ("META", "NASDAQ:META", "Meta Platforms", False),
+              ("QQQ", "NASDAQ:QQQ", "Invesco QQQ ETF", False),
           ]
 
           if STATE_FILE.exists():
