@@ -1,0 +1,547 @@
+name: Swing Trading - Tagesanalyse
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 22 * * 1-5"
+
+permissions: {}
+
+concurrency:
+  group: swing-trading-v1
+  cancel-in-progress: false
+
+jobs:
+  scanner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Boersenkalender installieren
+        run: python -m pip install "exchange-calendars==4.13"
+
+      - name: Scanner-Gedaechtnis laden
+        uses: actions/cache/restore@v4
+        with:
+          path: swing-state.json
+          key: swing-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            swing-v1-
+
+      - name: Swing-Kandidaten pruefen
+        env:
+          DATA_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import csv
+          import html
+          import json
+          import math
+          import os
+          import time
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          import exchange_calendars as xcals
+          import pandas as pd
+
+          VERSION = "swing-v1"
+          UTC = timezone.utc
+          BERLIN = ZoneInfo("Europe/Berlin")
+          NY = ZoneInfo("America/New_York")
+          STATE_FILE = Path("swing-state.json")
+
+          # Modellannahmen, keine ausgelesenen Broker-Konditionen.
+          CAPITAL_EUR = 500.0
+          MAX_POSITION_EUR = 200.0
+          RISK_EUR = 5.0
+
+          # Kostenreserve fuer Kauf UND Verkauf zusammen:
+          FIXED_COST_EUR = 2.0
+          VARIABLE_COST_RATE = 0.005
+          MIN_NET_CRV = 1.3
+          MAX_CANDIDATES = 2
+
+          STOCKS = [
+              ("AAPL", "Apple"),
+              ("MSFT", "Microsoft"),
+              ("NVDA", "Nvidia"),
+              ("AMZN", "Amazon"),
+              ("META", "Meta Platforms"),
+              ("GOOGL", "Alphabet Class A"),
+              ("AMD", "AMD"),
+              ("AVGO", "Broadcom"),
+              ("JPM", "JPMorgan Chase"),
+              ("V", "Visa"),
+              ("WMT", "Walmart"),
+              ("KO", "Coca-Cola"),
+              ("DIS", "Walt Disney"),
+              ("XOM", "Exxon Mobil"),
+              ("UBER", "Uber"),
+          ]
+
+          KEY = os.environ.get("DATA_KEY", "").strip()
+          TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+          CHAT = os.environ.get("CHAT_ID", "").strip()
+
+          if not all((KEY, TOKEN, CHAT)):
+              raise SystemExit("Ein erforderliches Secret fehlt.")
+
+          if STATE_FILE.exists():
+              try:
+                  state = json.loads(STATE_FILE.read_text())
+                  if not isinstance(state, dict):
+                      raise ValueError()
+                  if not isinstance(state.get("reports", {}), dict):
+                      raise ValueError()
+              except Exception:
+                  raise SystemExit("Scanner-Gedaechtnis unlesbar.") from None
+          else:
+              state = {}
+
+          state.setdefault("reports", {})
+
+          def save_state():
+              temporary = STATE_FILE.with_suffix(".tmp")
+              temporary.write_text(json.dumps(state), encoding="utf-8")
+              temporary.replace(STATE_FILE)
+
+          def summary(text):
+              print(text)
+              with open(
+                  os.environ["GITHUB_STEP_SUMMARY"], "a",
+                  encoding="utf-8"
+              ) as out:
+                  out.write(text + "\n\n")
+
+          last_request = 0.0
+
+          def api_series(symbol, stock=True):
+              global last_request
+              wait = 9.0 - (time.monotonic() - last_request)
+              if wait > 0:
+                  time.sleep(wait)
+              last_request = time.monotonic()
+
+              params = {
+                  "symbol": symbol,
+                  "interval": "1day",
+                  "outputsize": 160 if stock else 10,
+                  "order": "asc",
+                  "apikey": KEY,
+              }
+              if stock:
+                  params.update({
+                      "country": "United States",
+                      "prepost": "false",
+                      "adjust": "splits",
+                  })
+
+              url = (
+                  "https://api.twelvedata.com/time_series?"
+                  + urllib.parse.urlencode(params)
+              )
+              try:
+                  with urllib.request.urlopen(url, timeout=20) as response:
+                      data = json.load(response)
+              except Exception:
+                  raise ValueError("Kursabruf fehlgeschlagen") from None
+
+              if data.get("status") == "error":
+                  raise ValueError("Datenanbieter lehnt Anfrage ab")
+
+              meta = data.get("meta", {})
+              if meta.get("symbol") != symbol:
+                  raise ValueError("Instrument nicht bestaetigt")
+              if stock and meta.get("currency") != "USD":
+                  raise ValueError("Kurswaehrung nicht USD")
+
+              rows = []
+              for item in data.get("values", []):
+                  day = datetime.strptime(
+                      item["datetime"][:10], "%Y-%m-%d"
+                  ).date()
+                  values = [
+                      float(item[field])
+                      for field in ("open", "high", "low", "close")
+                  ]
+                  o, h, l, c = values
+                  if not all(math.isfinite(x) and x > 0 for x in values):
+                      raise ValueError("Ungueltiger Kurs")
+                  if not (l <= o <= h and l <= c <= h):
+                      raise ValueError("Widerspruechliche Kerze")
+                  rows.append({
+                      "date": day, "open": o, "high": h,
+                      "low": l, "close": c,
+                  })
+
+              rows.sort(key=lambda r: r["date"])
+              if not rows or len({r["date"] for r in rows}) != len(rows):
+                  raise ValueError("Fehlende oder doppelte Kerzen")
+              return rows
+
+          def telegram(text):
+              request = urllib.request.Request(
+                  f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                  data=json.dumps({
+                      "chat_id": CHAT,
+                      "text": text,
+                      "parse_mode": "HTML",
+                      "link_preview_options": {"is_disabled": True},
+                  }).encode(),
+                  headers={"Content-Type": "application/json"},
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(
+                      request, timeout=20
+                  ) as response:
+                      result = json.load(response)
+                  if not result.get("ok"):
+                      raise ValueError()
+              except Exception:
+                  raise ValueError("Telegram-Versand nicht bestaetigt") from None
+
+          def candidate(symbol, name, rows, fx, expected_dates):
+              # Tagesdaten muessen zur letzten abgeschlossenen
+              # US-Handelssitzung passen.
+              rows = [r for r in rows if r["date"] <= session_day]
+              if len(rows) < 80 or rows[-1]["date"] != session_day:
+                  raise ValueError("Tagesdaten fehlen oder sind veraltet")
+
+              actual_dates = [r["date"] for r in rows[-60:]]
+              if actual_dates != expected_dates:
+                  raise ValueError("Luecke in den letzten 60 Handelstagen")
+
+              closes = [r["close"] for r in rows]
+              sma50 = sum(closes[-50:]) / 50
+              old_sma50 = sum(closes[-55:-5]) / 50
+              if not (closes[-1] > sma50 > old_sma50):
+                  return None
+
+              # Zwei bis fuenf aufeinanderfolgende niedrigere
+              # Schlusskurse als einfache Ruecksetzerdefinition.
+              pullback = 0
+              for i in range(len(rows) - 1, 0, -1):
+                  if closes[i] < closes[i - 1]:
+                      pullback += 1
+                  else:
+                      break
+              if not 2 <= pullback <= 5:
+                  return None
+
+              tr = [
+                  max(
+                      rows[i]["high"] - rows[i]["low"],
+                      abs(rows[i]["high"] - rows[i-1]["close"]),
+                      abs(rows[i]["low"] - rows[i-1]["close"]),
+                  )
+                  for i in range(len(rows) - 14, len(rows))
+              ]
+              atr = sum(tr) / 14
+              if atr <= 0:
+                  return None
+
+              low = min(r["low"] for r in rows[-pullback:])
+              trigger = round(rows[-1]["high"] + 0.01, 2)
+              stop = math.floor((low - 0.1 * atr) * 100) / 100
+              distance = trigger - stop
+
+              if stop <= 0 or not 0.5 * atr <= distance <= 3 * atr:
+                  return None
+
+              # Maximaler Kaufkurs begrenzt das Hinterherlaufen.
+              max_entry = round(trigger + 0.1 * distance, 2)
+              target = round(trigger + 2 * distance, 2)
+
+              # Liegt das vorherige Hoch im Weg, kein Kandidat.
+              previous_high = max(
+                  r["high"] for r in rows[-60:-pullback]
+              )
+              if previous_high < target:
+                  return None
+
+              unit_eur = max_entry / fx
+              unit_risk_eur = (max_entry - stop) / fx
+              unit_cost_eur = unit_eur * VARIABLE_COST_RATE
+
+              available_risk = RISK_EUR - FIXED_COST_EUR
+              if available_risk <= 0:
+                  return None
+
+              qty = min(
+                  math.floor(
+                      min(MAX_POSITION_EUR, CAPITAL_EUR - FIXED_COST_EUR)
+                      / (unit_eur + unit_cost_eur)
+                  ),
+                  math.floor(
+                      available_risk / (unit_risk_eur + unit_cost_eur)
+                  ),
+              )
+              if qty < 1:
+                  return None
+
+              position = qty * unit_eur
+              costs = FIXED_COST_EUR + position * VARIABLE_COST_RATE
+              planned_risk = qty * unit_risk_eur + costs
+              net_target = qty * (target - max_entry) / fx - costs
+              net_crv = net_target / planned_risk
+
+              if net_target <= 0 or net_crv < MIN_NET_CRV:
+                  return None
+
+              return {
+                  "id": f"{VERSION}-{symbol}-{session_day}",
+                  "symbol": symbol,
+                  "name": name,
+                  "session": session_day.isoformat(),
+                  "valid_session": next_day.isoformat(),
+                  "trigger_usd": trigger,
+                  "max_entry_usd": max_entry,
+                  "stop_usd": stop,
+                  "target_usd": target,
+                  "shares": qty,
+                  "position_eur": round(position, 2),
+                  "cost_reserve_eur": round(costs, 2),
+                  "planned_risk_eur": round(planned_risk, 2),
+                  "net_target_eur": round(net_target, 2),
+                  "net_crv": round(net_crv, 2),
+                  "eurusd_reference": fx,
+                  "telegram_status": "noch nicht gesendet",
+                  "trade_status": "Kandidat; keine Ausfuehrung bekannt",
+              }
+
+          def journal(candidates):
+              path = Path("swing-tagebuch.csv")
+              if not candidates:
+                  return
+              with path.open(
+                  "w", encoding="utf-8-sig", newline=""
+              ) as out:
+                  writer = csv.DictWriter(
+                      out, fieldnames=list(candidates[0]), delimiter=";"
+                  )
+                  writer.writeheader()
+                  writer.writerows(candidates)
+
+          # Kalender beruecksichtigt reguläre US-Boersenfeiertage
+          # und verkuerzte Sitzungen.
+          calendar = xcals.get_calendar("XNYS")
+          now = pd.Timestamp.now(tz="UTC")
+          local_day = now.tz_convert("America/New_York").date()
+          session = calendar.date_to_session(
+              str(local_day), direction="previous"
+          )
+
+          # Erst 45 Minuten nach dem Sitzungsende verwenden.
+          if now < calendar.session_close(session) + pd.Timedelta(minutes=45):
+              session = calendar.previous_session(session)
+
+          session_day = session.date()
+          next_session = calendar.next_session(session)
+          next_day = next_session.date()
+          next_open = calendar.session_open(next_session)
+          next_close = calendar.session_close(next_session)
+
+          # Keine nachtraeglichen Kaufplaene fuer eine laufende Sitzung.
+          if now >= next_open:
+              summary(
+                  "Noch kein neuer abgeschlossener Tagesdatensatz. "
+                  "Bitte nach dem naechsten US-Boersenschluss starten. "
+                  "Keine Telegram-Nachricht gesendet."
+              )
+              raise SystemExit(0)
+
+          report_id = f"{VERSION}-{session_day}"
+          if report_id in state["reports"]:
+              summary(
+                  "Dieser Tagesbericht wurde bereits zum Versand "
+                  "reserviert. Keine automatische Wiederholung."
+              )
+              raise SystemExit(0)
+
+          expected_dates = [
+              s.date() for s in calendar.sessions
+              if s <= session
+          ][-60:]
+
+          # EUR/USD nur als Referenz fuer die Groessenberechnung.
+          try:
+              fx_rows = api_series("EUR/USD", stock=False)
+              today_utc = datetime.now(UTC).date()
+              fx_rows = [r for r in fx_rows if r["date"] <= today_utc]
+              if not fx_rows:
+                  raise ValueError()
+              fx_row = fx_rows[-1]
+              if (today_utc - fx_row["date"]).days > 4:
+                  raise ValueError()
+              fx = fx_row["close"]
+              if not 0.5 < fx < 2.0:
+                  raise ValueError()
+          except Exception:
+              raise SystemExit(
+                  "EUR/USD nicht verlaesslich verfuegbar. "
+                  "Keine Kandidaten berechnet."
+              ) from None
+
+          candidates = []
+          errors = []
+          checked = 0
+
+          for symbol, name in STOCKS:
+              try:
+                  rows = api_series(symbol)
+                  result = candidate(
+                      symbol, name, rows, fx, expected_dates
+                  )
+                  checked += 1
+                  if result:
+                      candidates.append(result)
+                      print(symbol + ": Kandidat gefunden.")
+                  else:
+                      print(symbol + ": Regeln nicht erfuellt.")
+              except Exception as exc:
+                  errors.append(symbol)
+                  # Nur selbst definierte, sichere Fehlermeldungen.
+                  print(symbol + ": Datenpruefung fehlgeschlagen.")
+
+          candidates.sort(key=lambda c: c["net_crv"], reverse=True)
+          candidates = candidates[:MAX_CANDIDATES]
+          journal(candidates)
+
+          opening = next_open.to_pydatetime().astimezone(BERLIN)
+          closing = next_close.to_pydatetime().astimezone(BERLIN)
+
+          parts = [
+              "<b>SWING · TEST · TAGESBERICHT</b>",
+              f"Analyse: {session_day:%d.%m.%Y}",
+              f"Geprueft: {checked}/{len(STOCKS)} Aktien",
+              f"Kandidaten: {len(candidates)}",
+              "",
+              "Echte Aktien · nur Kaufplaene · keine CFDs",
+              "Kein Einstieg live bestaetigt.",
+              f"Gueltig: {opening:%d.%m.%Y %H:%M}"
+              f"–{closing:%H:%M} Uhr Berlin.",
+          ]
+
+          for c in candidates:
+              parts.extend([
+                  "",
+                  f"<b>{html.escape(c['symbol'])} · "
+                  f"{html.escape(c['name'])}</b>",
+                  f"Einstieg erst bei Ueberschreiten: "
+                  f"{c['trigger_usd']:.2f} USD",
+                  f"Maximaler Kaufkurs: {c['max_entry_usd']:.2f} USD",
+                  f"Stop-Loss: {c['stop_usd']:.2f} USD",
+                  f"Ziel: {c['target_usd']:.2f} USD",
+                  f"Modellmenge: {c['shares']} ganze Aktien",
+                  f"Einsatz ca.: {c['position_eur']:.2f} EUR",
+                  f"Kostenreserve: {c['cost_reserve_eur']:.2f} EUR",
+                  f"Geplantes Risiko: {c['planned_risk_eur']:.2f} EUR",
+                  f"Gewinn am Ziel nach Kostenannahme: "
+                  f"{c['net_target_eur']:.2f} EUR, vor Steuern",
+                  f"ID: {c['id']}",
+              ])
+
+          if not candidates:
+              parts.extend([
+                  "",
+                  "Keine passenden Kandidaten."
+                  if checked else "Analyse fehlgeschlagen: keine gueltigen Aktienkurse.",
+                  "Kein Kaufplan fuer die naechste Sitzung.",
+              ])
+
+          if errors:
+              parts.extend([
+                  "",
+                  "Datenfehler: " + ", ".join(errors),
+                  "Auswertung unvollstaendig.",
+              ])
+
+          parts.extend([
+              "",
+              "Vor Einstieg Quartalszahlen und Nachrichten pruefen.",
+              "Bei Quartalszahlen in den naechsten 7 Kalendertagen auslassen.",
+              "Liegt der Kurs oberhalb des maximalen Kaufkurses: auslassen.",
+              "Kein einfacher Limitkauf unterhalb des Ausloesers.",
+              "Bestehende Positionen und freie Mittel selbst pruefen.",
+              "Max. 2 Positionen; Gesamtrisiko geplant max. 10 EUR.",
+              "Kostenannahme je Position: 2 EUR + 0,5% des Einsatzes.",
+              "Brokerkosten, Spread und FX vor Kauf abgleichen.",
+              "Kursluecken koennen den geplanten Verlust ueberschreiten.",
+              "Kein automatischer Kauf, Verkauf oder Positionsmonitor.",
+              "Ungefuellten Kaufplan zum Sitzungsende verwerfen.",
+              "Kurse: Twelve Data, nicht dein Brokerkurs.",
+          ])
+
+          message = "\n".join(parts)
+          if len(message) > 4000:
+              raise SystemExit("Telegram-Bericht unerwartet zu lang.")
+
+          # Vor Versand reservieren: Bei Timeout keine automatischen
+          # Doppelmeldungen. Cache-Verlust kann dennoch Duplikate erzeugen.
+          state["reports"][report_id] = "Versand vorbereitet"
+          state["reports"] = dict(
+              sorted(state["reports"].items())[-90:]
+          )
+          save_state()
+
+          for c in candidates:
+              c["telegram_status"] = "Versand vorbereitet"
+          journal(candidates)
+
+          try:
+              telegram(message)
+          except Exception:
+              for c in candidates:
+                  c["telegram_status"] = "Versand nicht bestaetigt"
+              journal(candidates)
+              summary(
+                  "Telegram-Versand nicht bestaetigt. "
+                  "Telegram und Laufprotokoll manuell pruefen."
+              )
+              raise SystemExit(1) from None
+
+          state["reports"][report_id] = "Von Telegram angenommen"
+          save_state()
+          for c in candidates:
+              c["telegram_status"] = "Von Telegram angenommen"
+          journal(candidates)
+
+          summary(
+              f"Analyse {session_day}: {checked}/{len(STOCKS)} Aktien, "
+              f"{len(candidates)} Kandidaten, {len(errors)} Datenfehler. "
+              "Tagesbericht von Telegram angenommen. "
+              "Keine Orders ausgefuehrt. "
+              "CSV enthaelt nur Kandidaten dieses Durchlaufs."
+          )
+
+          if errors:
+              raise SystemExit("Mindestens eine Aktienpruefung fehlgeschlagen.")
+          PY
+
+      - name: Scanner-Gedaechtnis speichern
+        if: ${{ always() && hashFiles('swing-state.json') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: swing-state.json
+          key: swing-v1-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Swing-Tagebuch sichern
+        if: ${{ always() && hashFiles('swing-tagebuch.csv') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: swing-tagebuch-${{ github.run_id }}-${{ github.run_attempt }}
+          path: swing-tagebuch.csv
+          if-no-files-found: error
+          retention-days: 30
